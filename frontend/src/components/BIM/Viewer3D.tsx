@@ -214,12 +214,20 @@ export default function Viewer3D() {
       mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
       mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
       raycaster.setFromCamera(mouse, camera)
-      const intersects = raycaster.intersectObjects(scene.children, true)
-      if (!intersects.length) {
+      // Prefer intersecting only model meshes if available
+      const modelGroup = modelGroupRef.current
+      const candidates = modelGroup ? modelGroup.children : scene.children
+      const allHits = raycaster.intersectObjects(candidates, true)
+      if (!allHits.length) {
         clearSelection()
         return
       }
-      const intersect = intersects[0]
+      // Find first hit that belongs to IFC (web-ifc-three marks meshes with modelID)
+      const intersect = allHits.find(h => (h.object as any).modelID != null) ?? null
+      if (!intersect) {
+        clearSelection()
+        return
+      }
       const faceIndex = intersect.faceIndex ?? null
       const object = intersect.object as THREE.Mesh
       const geometry = object.geometry as THREE.BufferGeometry

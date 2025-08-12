@@ -1,4 +1,4 @@
-// Lightweight polyfill for BufferGeometry merge used by web-ifc-three
+// Custom polyfill for BufferGeometry merge used by web-ifc-three
 // Supports common attributes (position, normal, uv) and index; adds groups when useGroups=true
 import { BufferGeometry, BufferAttribute } from "three"
 
@@ -23,7 +23,7 @@ function concatTypedArrays(arrays) {
   return result
 }
 
-function mergeGeometries(geometries, useGroups = false) {
+export function mergeGeometries(geometries, useGroups = false) {
   if (!Array.isArray(geometries) || geometries.length === 0) return null
 
   // Clone to avoid mutating inputs
@@ -65,7 +65,6 @@ function mergeGeometries(geometries, useGroups = false) {
   })
 
   const merged = new BufferGeometry()
-  const indexTyped = indices[0] instanceof Uint32Array ? Uint32Array : indices[0] instanceof Uint16Array ? Uint16Array : Uint32Array
   merged.setIndex(new BufferAttribute(concatTypedArrays(indices), 1))
 
   const posItemSize = geoms[0].getAttribute("position").itemSize
@@ -94,10 +93,6 @@ function mergeGeometries(geometries, useGroups = false) {
   return merged
 }
 
-// CommonJS-style exports to satisfy esbuild interop for named/default imports
-const api = { mergeGeometries, mergeBufferGeometries: mergeGeometries }
-// Named
-exports.mergeGeometries = mergeGeometries
-exports.mergeBufferGeometries = mergeGeometries
-// Default
-module.exports = api
+// Also export the alias name for compatibility
+export const mergeBufferGeometries = mergeGeometries
+export default { mergeGeometries, mergeBufferGeometries }
