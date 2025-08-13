@@ -1,6 +1,11 @@
 import { Box, Flex, Spinner, Text } from "@chakra-ui/react"
 import { useEffect, useRef, useState } from "react"
 import * as THREE from "three"
+// Ensure BVH helpers are attached before IFCLoader uses them
+import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh"
+;(THREE.BufferGeometry.prototype as any).computeBoundsTree = computeBoundsTree
+;(THREE.BufferGeometry.prototype as any).disposeBoundsTree = disposeBoundsTree
+;(THREE.Mesh.prototype as any).raycast = acceleratedRaycast
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls"
 import { IFCLoader } from "web-ifc-three/IFCLoader"
 
@@ -82,6 +87,11 @@ export default function Viewer3D() {
     // Use local wasm matching the installed web-ifc version
     // We copied web-ifc.wasm to /public/wasm/web-ifc.wasm
     ifcLoader.ifcManager.setWasmPath("/wasm/")
+    // Enable BVH acceleration for more robust raycasting/selection
+    try {
+      ;(ifcLoader.ifcManager as any).setupThreeMeshBVH(THREE)
+      // optional: reduce triangle threshold warnings (model-specific)
+    } catch {}
     ifcLoaderRef.current = ifcLoader
 
     let raf = 0
@@ -209,51 +219,171 @@ export default function Viewer3D() {
     const raycaster = new THREE.Raycaster()
     const mouse = new THREE.Vector2()
 
-    const onClick = (event: MouseEvent) => {
+    const onClick = async (event: MouseEvent) => {
       const rect = (renderer.domElement as HTMLCanvasElement).getBoundingClientRect()
       mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
       mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
-      raycaster.setFromCamera(mouse, camera)
-      // Prefer intersecting only model meshes if available
-      const modelGroup = modelGroupRef.current
-      const candidates = modelGroup ? modelGroup.children : scene.children
-      const allHits = raycaster.intersectObjects(candidates, true)
-      if (!allHits.length) {
+      
+      const modelID = currentModelIdRef.current
+      if (modelID == null) {
         clearSelection()
         return
       }
-      // Find first hit that belongs to IFC (web-ifc-three marks meshes with modelID)
-      const intersect = allHits.find(h => (h.object as any).modelID != null) ?? null
-      if (!intersect) {
-        clearSelection()
-        return
-      }
-      const faceIndex = intersect.faceIndex ?? null
-      const object = intersect.object as THREE.Mesh
-      const geometry = object.geometry as THREE.BufferGeometry
-      const modelID = (object as any).modelID ?? currentModelIdRef.current
-      if (faceIndex == null || !geometry || modelID == null) {
-        clearSelection()
-        return
-      }
-      const expressID = ifc.getExpressId(geometry, faceIndex)
-      if (expressID != null) {
-        currentModelIdRef.current = modelID
-        const mat = highlightMatRef.current!
-        ifc.createSubset({
-          modelID,
-          ids: [expressID],
-          material: mat,
-          scene,
-          removePrevious: true,
-        })
-        setSelectedElementId(expressID)
-        // Fetch props/QTO if missing in cache
-        const hasProps = propsMap[String(expressID)] != null
-        const hasQty = qtyMap[String(expressID)] != null
-        if (!hasProps || !hasQty) {
-          fetchPropsAndQuantities(expressID)
+      
+      try {
+        // Cast ray and get intersection
+        raycaster.setFromCamera(mouse, camera)
+        const modelGroup = modelGroupRef.current
+        if (!modelGroup) {
+          clearSelection()
+          return
         }
+        
+        const intersects = raycaster.intersectObjects(modelGroup.children, true)
+        console.debug('Raycast intersects count:', intersects.length)
+        if (!intersects.length) {
+          clearSelection()
+          return
+        }
+        
+        // Helper to resolve modelID from object hierarchy
+        const resolveModelId = (obj: any): number | undefined => {
+          let cur: any = obj
+          while (cur) {
+            if (typeof cur.modelID === 'number') return cur.modelID
+            cur = cur.parent
+          }
+          return undefined
+        }
+        // Prefer hits that have 'expressID' attribute (more reliable)
+        let validHit = intersects.find(hit => {
+          const obj = hit.object as any
+          const objModelId = resolveModelId(obj)
+          const g: THREE.BufferGeometry | undefined = (obj && obj.geometry) as any
+          const hasExpress = !!g?.getAttribute && !!g.getAttribute('expressID')
+          return objModelId === modelID && hit.faceIndex != null && hasExpress
+        })
+        // Fallback: accept any IFC hit with a faceIndex
+        if (!validHit) {
+          validHit = intersects.find(hit => {
+            const obj = hit.object as any
+            const objModelId = resolveModelId(obj)
+            return objModelId === modelID && hit.faceIndex != null
+          })
+          if (!validHit) {
+            console.debug('No valid IFC hit found (even fallback)')
+          } else {
+            console.debug('Using fallback IFC hit without expressID attribute')
+          }
+        }
+        
+        if (!validHit) {
+          clearSelection()
+          return
+        }
+        
+        // Compute expressID from the picked face using web-ifc
+        let expressID: number | null = null
+        const hitObj = validHit.object as THREE.Mesh
+        const geom = hitObj.geometry as THREE.BufferGeometry
+        const faceIndex = validHit.faceIndex as number
+        if (geom && Number.isInteger(faceIndex)) {
+          try {
+            const pos = geom.getAttribute('position') as THREE.BufferAttribute | undefined
+            const idx = geom.getIndex()
+            const expressAttr = (geom as any).getAttribute?.('expressID')
+            // Verbose diagnostics to track the geometry state at pick time
+            console.debug('IFC pick diagnostics', {
+              posExists: !!pos,
+              idxExists: !!idx,
+              idxCount: idx?.count,
+              faceIndex,
+              hasExpressIdAttr: !!expressAttr,
+              drawRange: (geom as any).drawRange,
+            })
+            if (!pos) {
+              console.warn('Geometry has no position attribute; cannot compute expressID')
+            } else if (!idx) {
+              console.warn('Geometry has no index after pick; cannot compute expressID')
+            } else if (idx.count % 3 !== 0) {
+              console.warn('Geometry index not divisible by 3; invalid triangle buffer')
+            } else if (faceIndex < 0 || faceIndex * 3 + 2 >= idx.count) {
+              console.warn('faceIndex out of range for geometry index', { faceIndex, indexCount: idx.count })
+            } else {
+              // web-ifc API: getExpressId(bufferGeometry, faceIndex)
+              try {
+                expressID = (ifc as any).getExpressId(geom, faceIndex)
+              } catch (e) {
+                console.warn('getExpressId failed', e)
+                // Fallback: derive expressID from geometry attribute if present
+                const exprAttr: any = (geom as any).getAttribute?.('expressID')
+                if (exprAttr) {
+                  try {
+                    const iAttr = geom.getIndex()
+                    const triStart = faceIndex * 3
+                    const getIndexAt = (j: number) => {
+                      if (!iAttr) return triStart + j
+                      if (typeof (iAttr as any).getX === 'function') return (iAttr as any).getX(triStart + j)
+                      if ((iAttr as any).array) return (iAttr as any).array[triStart + j]
+                      return triStart + j
+                    }
+                    const v0 = getIndexAt(0)
+                    const v1 = getIndexAt(1)
+                    const v2 = getIndexAt(2)
+                    const getIdAt = (vi: number) => {
+                      if (typeof exprAttr.getX === 'function') return exprAttr.getX(vi)
+                      if (exprAttr.array) return exprAttr.array[vi]
+                      return undefined
+                    }
+                    const id0 = getIdAt(v0)
+                    const id1 = getIdAt(v1)
+                    const id2 = getIdAt(v2)
+                    console.debug('Fallback expressID candidates', { v0, v1, v2, id0, id1, id2 })
+                    const nums = [id0, id1, id2].filter((n) => typeof n === 'number' && !Number.isNaN(n)) as number[]
+                    if (nums.length) {
+                      // pick majority value; if tie, pick first
+                      const counts = new Map<number, number>()
+                      nums.forEach((n) => counts.set(n, (counts.get(n) || 0) + 1))
+                      let best = nums[0]
+                      let bestC = 0
+                      counts.forEach((c, n) => { if (c > bestC) { best = n; bestC = c } })
+                      expressID = Math.round(best)
+                    }
+                  } catch (fallbackErr) {
+                    console.warn('Fallback expressID derivation failed', fallbackErr)
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('getExpressId failed (outer)', e)
+          }
+        }
+
+        if (expressID != null && typeof expressID === 'number') {
+          const mat = highlightMatRef.current!
+          ifc.createSubset({
+            modelID,
+            ids: [expressID],
+            material: mat,
+            scene,
+            removePrevious: true,
+          })
+          console.debug('Created subset for expressID', expressID, 'modelID', modelID)
+          setSelectedElementId(expressID)
+          // Fetch props/QTO if missing in cache
+          const hasProps = propsMap[String(expressID)] != null
+          const hasQty = qtyMap[String(expressID)] != null
+          if (!hasProps || !hasQty) {
+            fetchPropsAndQuantities(expressID)
+          }
+        } else {
+          console.warn("Could not determine expressID for selected object")
+          clearSelection()
+        }
+      } catch (error) {
+        console.warn("Failed to handle IFC selection:", error)
+        clearSelection()
       }
     }
 
@@ -286,6 +416,17 @@ export default function Viewer3D() {
         if (child.isMesh) {
           child.castShadow = true
           child.receiveShadow = true
+          // Ensure geometry has an index; web-ifc selection requires indexed triangles
+          const geom: THREE.BufferGeometry | undefined = child.geometry
+          if (geom && !geom.getIndex()) {
+            const posAttr = geom.getAttribute("position") as THREE.BufferAttribute | undefined
+            if (posAttr) {
+              const count = posAttr.count
+              const indices = new Uint32Array(count)
+              for (let i = 0; i < count; i++) indices[i] = i
+              geom.setIndex(new THREE.BufferAttribute(indices, 1))
+            }
+          }
         }
       })
       zoomExtents()

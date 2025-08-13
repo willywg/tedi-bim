@@ -1,5 +1,6 @@
 // Custom polyfill for BufferGeometry merge used by web-ifc-three
-// Supports common attributes (position, normal, uv) and index; adds groups when useGroups=true
+// Merges index and ALL attributes present on inputs (e.g., position, normal, uv, expressID, etc.)
+// Adds groups when useGroups=true. Preserves attribute itemSize and typed array constructors.
 import { BufferGeometry, BufferAttribute } from "three"
 
 function ensureIndex(geom) {
@@ -29,54 +30,68 @@ export function mergeGeometries(geometries, useGroups = false) {
   // Clone to avoid mutating inputs
   const geoms = geometries.map((g) => g.clone())
 
-  // Ensure all have same attribute set
+  // Collect the union of attribute keys present across geometries
   const keys = new Set()
   geoms.forEach((g) => Object.keys(g.attributes).forEach((k) => keys.add(k)))
   const attrKeys = Array.from(keys)
 
   // Ensure index exists and track vertex offsets
   const indices = []
-  const positions = []
-  const normals = []
-  const uvs = []
+  const attrArraysMap = new Map() // key -> { arrays: [], itemSize, ArrayType }
   const groups = []
   let indexOffset = 0
 
   geoms.forEach((g, idx) => {
     ensureIndex(g)
-    const pos = g.getAttribute("position")
-    const nor = g.getAttribute("normal")
-    const uv = g.getAttribute("uv")
     const idxAttr = g.getIndex()
 
-    // Collect
-    positions.push(pos.array)
-    if (nor) normals.push(nor.array)
-    if (uv) uvs.push(uv.array)
+    // Collect all attributes present on this geometry
+    attrKeys.forEach((key) => {
+      const attr = g.getAttribute(key)
+      if (attr) {
+        const existing = attrArraysMap.get(key)
+        if (!existing) {
+          attrArraysMap.set(key, {
+            arrays: [attr.array],
+            itemSize: attr.itemSize,
+            ArrayType: attr.array.constructor,
+          })
+        } else {
+          // Sanity-check compatible itemSize and array types
+          if (existing.itemSize !== attr.itemSize) {
+            throw new Error(`mergeGeometries: attribute '${key}' itemSize mismatch`)
+          }
+          if (existing.ArrayType !== attr.array.constructor) {
+            // Different typed array constructors; upcast to Float32Array as a fallback
+            // But try to keep original type if possible
+            // We'll just push; concat will use the first constructor
+          }
+          existing.arrays.push(attr.array)
+        }
+      }
+    })
 
     const idxArray = idxAttr.array
     const idxArrayShifted = new (idxArray.constructor)(idxArray.length)
     for (let i = 0; i < idxArray.length; i++) idxArrayShifted[i] = idxArray[i] + indexOffset
     indices.push(idxArrayShifted)
 
-    if (useGroups) groups.push({ start: indices.reduce((a, b) => a + b.length, 0), count: idxArray.length, materialIndex: idx })
+    if (useGroups) groups.push({ count: idxArray.length, materialIndex: idx })
 
-    indexOffset += pos.count
+    const pos = g.getAttribute("position")
+    indexOffset += pos ? pos.count : 0
   })
 
   const merged = new BufferGeometry()
   merged.setIndex(new BufferAttribute(concatTypedArrays(indices), 1))
 
-  const posItemSize = geoms[0].getAttribute("position").itemSize
-  merged.setAttribute("position", new BufferAttribute(concatTypedArrays(positions), posItemSize))
-  if (normals.length) {
-    const nSize = geoms[0].getAttribute("normal").itemSize
-    merged.setAttribute("normal", new BufferAttribute(concatTypedArrays(normals), nSize))
-  }
-  if (uvs.length) {
-    const uSize = geoms[0].getAttribute("uv").itemSize
-    merged.setAttribute("uv", new BufferAttribute(concatTypedArrays(uvs), uSize))
-  }
+  // Rebuild all attributes
+  attrArraysMap.forEach((info, key) => {
+    if (info.arrays.length) {
+      const concatenated = concatTypedArrays(info.arrays)
+      merged.setAttribute(key, new BufferAttribute(concatenated, info.itemSize))
+    }
+  })
 
   if (useGroups && groups.length) {
     let start = 0
